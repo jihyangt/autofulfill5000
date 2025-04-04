@@ -120,6 +120,54 @@ def get_incoming_inventory(product_ids):
     return {product_id: 0 for product_id in product_ids}
 
 
+def get_committed_quantities(product_ids, product_map):
+    """Get quantities committed to unfulfilled orders"""
+    print("Fetching unfulfilled orders to calculate committed quantities...")
+    committed_quantities = {product_id: 0 for product_id in product_ids}
+    
+    # Get unfulfilled orders
+    url = f"{BASE_URL}/orders.json?status=open&fulfillment_status=unfulfilled&limit=250"
+    
+    while url:
+        response = requests.get(url, headers=HEADERS)
+        if response.status_code != 200:
+            print(f"Error fetching unfulfilled orders: {response.status_code}")
+            print(response.text)
+            return committed_quantities
+        
+        data = response.json()
+        unfulfilled_orders = data.get('orders', [])
+        
+        # Process each unfulfilled order
+        for order in unfulfilled_orders:
+            # Skip cancelled or refunded orders
+            if order.get('cancelled_at') or order.get('refunded_at'):
+                continue
+                
+            # Process line items
+            for line_item in order.get('line_items', []):
+                product_id = line_item.get('product_id')
+                if not product_id or product_id not in product_map:
+                    continue
+                
+                # Check if the line item is unfulfilled
+                fulfillment_status = line_item.get('fulfillment_status')
+                if fulfillment_status is None or fulfillment_status == 'unfulfilled':
+                    # Add the unfulfilled quantity to the committed quantities
+                    quantity = line_item.get('quantity', 0)
+                    committed_quantities[product_id] += quantity
+        
+        # Check for pagination
+        link_header = response.headers.get('Link')
+        url = None
+        if link_header and 'rel="next"' in link_header:
+            next_link = [l for l in link_header.split(',') if 'rel="next"' in l]
+            if next_link:
+                url = next_link[0].split('<')[1].split('>')[0]
+    
+    return committed_quantities
+
+
 def get_recent_orders(days=14):
     """Get orders from the last specified number of days"""
     # Calculate date range
@@ -176,20 +224,30 @@ def calculate_sales_by_product(orders, product_map):
     return sales_by_product
 
 
-def calculate_recommended_quantity(sales_quantity, current_inventory, incoming_inventory):
-    """Calculate recommended order quantity based on sales, current inventory, and incoming inventory"""
+def calculate_recommended_quantity(sales_quantity, current_inventory, incoming_inventory, committed_quantity=0):
+    """Calculate recommended order quantity based on sales, current inventory, incoming inventory, and committed quantities"""
     # Expected sales for the next order period
     expected_sales = sales_quantity
     
-    # Total available inventory (current + incoming)
-    total_available = current_inventory + incoming_inventory
+    # Total available inventory (current + incoming - committed)
+    # Subtract committed quantities from available inventory
+    total_available = current_inventory + incoming_inventory - committed_quantity
     
-    # Calculate how much we need
-    needed = max(0, (expected_sales * RESTOCK_BUFFER) - total_available)
+    # Handle negative inventory differently - it means we're already short this amount
+    if total_available < 0:
+        # We need to cover the negative inventory plus expected sales with buffer
+        needed = abs(total_available) + (expected_sales * RESTOCK_BUFFER)
+    else:
+        # Normal calculation when inventory is positive
+        needed = max(0, (expected_sales * RESTOCK_BUFFER) - total_available)
     
-    # Ensure we maintain minimum stock levels
-    if total_available < MIN_STOCK_THRESHOLD:
+    # Only apply minimum stock threshold if the product has sales
+    # But don't double-count the negative inventory adjustment
+    if sales_quantity > 0 and total_available >= 0 and total_available < MIN_STOCK_THRESHOLD:
         needed += (MIN_STOCK_THRESHOLD - total_available)
+    elif sales_quantity > 0 and total_available < 0:
+        # For negative inventory, ensure we at least reach the minimum threshold
+        needed = max(needed, abs(total_available) + MIN_STOCK_THRESHOLD)
     
     return round(needed)
 
@@ -217,6 +275,9 @@ def generate_purchase_order_recommendations():
     print("Fetching incoming inventory...")
     incoming_inventory = get_incoming_inventory(product_ids)
     
+    # Get quantities committed to unfulfilled orders
+    committed_quantities = get_committed_quantities(product_ids, product_map)
+    
     # Get recent orders
     print(f"Fetching orders from the last {ORDER_FREQUENCY_DAYS} days...")
     recent_orders = get_recent_orders(days=ORDER_FREQUENCY_DAYS)
@@ -231,9 +292,10 @@ def generate_purchase_order_recommendations():
         sales_quantity = sales_by_product.get(product_id, 0)
         current_inventory = inventory_levels.get(product_id, 0)
         incoming = incoming_inventory.get(product_id, 0)
+        committed = committed_quantities.get(product_id, 0)
         
         recommended_quantity = calculate_recommended_quantity(
-            sales_quantity, current_inventory, incoming
+            sales_quantity, current_inventory, incoming, committed
         )
         
         recommendations.append({
@@ -242,6 +304,7 @@ def generate_purchase_order_recommendations():
             'sales_last_2_weeks': sales_quantity,
             'current_inventory': current_inventory,
             'incoming_inventory': incoming,
+            'committed_quantity': committed,
             'recommended_order': recommended_quantity
         })
     
@@ -265,11 +328,12 @@ def display_recommendations(recommendations):
             rec['sales_last_2_weeks'],
             rec['current_inventory'],
             rec['incoming_inventory'],
+            rec['committed_quantity'],
             rec['recommended_order']
         ])
     
     # Display table
-    headers = ["Item", "Sales (2 Weeks)", "Current Inventory", "Incoming", "Recommended Order"]
+    headers = ["Item", "Sales (2 Weeks)", "Current Inventory", "Incoming", "Committed", "Recommended Order"]
     print(tabulate(table_data, headers=headers, tablefmt="grid"))
     
     # Export to CSV
@@ -280,7 +344,7 @@ def export_to_csv(recommendations, filename="tropica_order_recommendations.csv")
     """Export recommendations to a CSV file"""
     with open(filename, 'w', newline='') as csvfile:
         fieldnames = ['item', 'sales_last_2_weeks', 'current_inventory', 
-                     'incoming_inventory', 'recommended_order']
+                     'incoming_inventory', 'committed_quantity', 'recommended_order']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
         
         writer.writeheader()
