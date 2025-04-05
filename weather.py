@@ -49,7 +49,8 @@ def analyze_shipping_conditions(city, province):
             "wed_avg_temp": None,
             "thu_avg_temp": None,
             "city": city,
-            "province": province
+            "province": province,
+            "extra_cold": False
         }
 
     # Get current date and calculate the dates for next Wednesday and Thursday
@@ -77,7 +78,9 @@ def analyze_shipping_conditions(city, province):
             "wed_avg_temp": None,
             "thu_avg_temp": None,
             "city": city,
-            "province": province
+            "province": province,
+            "wednesday_date": wednesday_date,
+            "thursday_date": thursday_date
         }
     
     # Extract hourly data
@@ -114,6 +117,13 @@ def analyze_shipping_conditions(city, province):
     # Determine overall shipping possibility
     can_ship = wednesday_delivery or thursday_delivery
     
+    # Check for extra cold conditions (between 0°C and -2°C)
+    extra_cold = False
+    if wednesday_delivery and wed_avg_temp is not None and 0 >= wed_avg_temp >= -2:
+        extra_cold = True
+    if thursday_delivery and thu_avg_temp is not None and 0 >= thu_avg_temp >= -2:
+        extra_cold = True
+    
     reason = "Weather conditions acceptable for delivery"
     if not can_ship:
         reason = "Temperature too low on both Wednesday and Thursday"
@@ -121,6 +131,9 @@ def analyze_shipping_conditions(city, province):
         reason = "Delivery possible on Wednesday only"
     elif thursday_delivery and not wednesday_delivery:
         reason = "Delivery possible on Thursday only"
+    
+    if extra_cold:
+        reason += " (Extra insulation required)"
     
     return {
         "can_ship": can_ship,
@@ -130,7 +143,10 @@ def analyze_shipping_conditions(city, province):
         "wed_avg_temp": wed_avg_temp,
         "thu_avg_temp": thu_avg_temp,
         "city": city,
-        "province": province
+        "province": province,
+        "extra_cold": extra_cold,
+        "wednesday_date": wednesday_date,
+        "thursday_date": thursday_date
     }
 
 
@@ -164,9 +180,21 @@ def process_orders_csv(csv_file="orders_export (4).csv"):
                     
                     try:
                         qty = int(quantity)
+                        # Categorize items as shrimp/potted plants or other items
+                        # Special cases for specific shrimp names and excluding ShrimpsafeNet
+                        is_shrimp_or_potted = (
+                            ('shrimp' in item_name.lower() and not 'shrimpsafe' in item_name.lower()) or 
+                            'extreme blue bolt' in item_name.lower() or
+                            'red pinto galaxy' in item_name.lower() or
+                            'pack' in item_name.lower() or 
+                            'potted' in item_name.lower()
+                            # Removed 1-2-grow as requested
+                        )
+                        
                         order_quantities[order_id].append({
                             'quantity': qty,
-                            'item_name': item_name
+                            'item_name': item_name,
+                            'is_shrimp_or_potted': is_shrimp_or_potted
                         })
                     except ValueError:
                         # Skip if quantity is not a valid number
@@ -192,22 +220,52 @@ def process_orders_csv(csv_file="orders_export (4).csv"):
                 province = row.get('Shipping Province', '')
                 shipping_name = row.get('Shipping Name', '')
                 
-                # Create packing list string
+                # Create categorized packing lists
                 packing_list = ""
+                shrimp_potted_list = []
+                other_items_list = []
+                
                 if order_id in order_quantities:
-                    items = []
                     for item in order_quantities[order_id]:
-                        items.append(f"{item['quantity']} x {item['item_name']}")
-                    packing_list = ", ".join(items)
+                        item_str = f"{item['quantity']} x {item['item_name']}"
+                        if item['is_shrimp_or_potted']:
+                            shrimp_potted_list.append(item_str)
+                        else:
+                            other_items_list.append(item_str)
+                    
+                    # Create combined packing list for the full order
+                    all_items = []
+                    if shrimp_potted_list:
+                        all_items.append("SHRIMP+POTTED: " + ", ".join(shrimp_potted_list))
+                    if other_items_list:
+                        all_items.append("OTHER ITEMS: " + ", ".join(other_items_list))
+                    packing_list = " | ".join(all_items)
                 
                 if city and province:
                     shipping_result = analyze_shipping_conditions(city, province)
                     shipping_result['order_id'] = order_id
                     shipping_result['customer_name'] = shipping_name
                     shipping_result['packing_list'] = packing_list.strip()
+                    shipping_result['shrimp_potted_items'] = ", ".join(shrimp_potted_list) if shrimp_potted_list else ""
+                    shipping_result['other_items'] = ", ".join(other_items_list) if other_items_list else ""
+                    shipping_result['shipping_day'] = "Wednesday" if shipping_result['wednesday_delivery'] else "Thursday" if shipping_result['thursday_delivery'] else "None"
                     shipping_decisions.append(shipping_result)
                     processed_order_ids.add(order_id)
                 else:
+                    # Get current date for wednesday and thursday dates
+                    today = datetime.now()
+                    days_until_wednesday = (2 - today.weekday()) % 7  # 2 represents Wednesday
+                    days_until_thursday = (3 - today.weekday()) % 7   # 3 represents Thursday
+                    
+                    # If today is after Wednesday/Thursday, get next week's dates
+                    if days_until_wednesday == 0 and today.hour >= 17:  # After 5pm on Wednesday
+                        days_until_wednesday = 7
+                    if days_until_thursday == 0 and today.hour >= 17:  # After 5pm on Thursday
+                        days_until_thursday = 7
+                        
+                    wednesday_date = (today + timedelta(days=days_until_wednesday)).strftime("%Y-%m-%d")
+                    thursday_date = (today + timedelta(days=days_until_thursday)).strftime("%Y-%m-%d")
+                    
                     shipping_decisions.append({
                         "order_id": order_id,
                         "customer_name": shipping_name,
@@ -219,7 +277,13 @@ def process_orders_csv(csv_file="orders_export (4).csv"):
                         "thu_avg_temp": None,
                         "city": city,
                         "province": province,
-                        "packing_list": packing_list.strip()
+                        "extra_cold": False,
+                        "packing_list": packing_list.strip(),
+                        "shrimp_potted_items": ", ".join(shrimp_potted_list) if shrimp_potted_list else "",
+                        "other_items": ", ".join(other_items_list) if other_items_list else "",
+                        "shipping_day": "None",
+                        "wednesday_date": wednesday_date,
+                        "thursday_date": thursday_date
                     })
                     processed_order_ids.add(order_id)
     
@@ -239,26 +303,164 @@ def generate_shipping_report(decisions, output_file="shipping_decisions.csv"):
         print("No shipping decisions to report.")
         return
     
-    # Sort decisions by can_ship field (True first, False last)
-    sorted_decisions = sorted(decisions, key=lambda x: not x['can_ship'])
+    # Sort decisions by shipping day and can_ship field
+    sorted_decisions = sorted(decisions, key=lambda x: (x['shipping_day'] != 'Wednesday', x['shipping_day'] != 'Thursday', not x['can_ship']))
     
-    fieldnames = ['order_id', 'customer_name', 'city', 'province', 'can_ship', 'wednesday_delivery', 'thursday_delivery', 'reason', 'wed_avg_temp', 'thu_avg_temp', 'packing_list']
+    # Prepare decisions with modified fields
+    modified_decisions = []
+    for decision in sorted_decisions:
+        
+        # Determine heatpack requirement based on temperature
+        needs_heatpack = "N"
+        if decision['wednesday_delivery'] and decision['wed_avg_temp'] is not None and decision['wed_avg_temp'] < 8.0:
+            needs_heatpack = "Y"
+        elif decision['thursday_delivery'] and decision['thu_avg_temp'] is not None and decision['thu_avg_temp'] < 8.0:
+            needs_heatpack = "Y"
+        
+        # Update shipping day to include date or set to N/A if can't ship
+        if not decision['can_ship']:
+            shipping_day_with_date = "N/A"
+        elif decision['wednesday_delivery']:
+            shipping_day_with_date = f"Wednesday {decision['wednesday_date']}"
+        elif decision['thursday_delivery']:
+            shipping_day_with_date = f"Thursday {decision['thursday_date']}"
+        else:
+            shipping_day_with_date = "N/A"
+        
+        # Create modified decision with only required fields
+        # Add temperature for the shipping day
+        shipping_temp = None
+        if decision['wednesday_delivery'] and decision['shipping_day'] == 'Wednesday':
+            shipping_temp = decision['wed_avg_temp']
+        elif decision['thursday_delivery'] and decision['shipping_day'] == 'Thursday':
+            shipping_temp = decision['thu_avg_temp']
+            
+        # Format temperature to 1 decimal place if available
+        formatted_temp = f"{shipping_temp:.1f}°C" if shipping_temp is not None else "N/A"
+        
+        modified_decision = {
+            'order_id': decision['order_id'],
+            'customer_name': decision['customer_name'],
+            'city': decision['city'],
+            'province': decision['province'],
+            'can_ship': decision['can_ship'],
+            'shipping_day': shipping_day_with_date,
+            'temperature': formatted_temp,
+            'extra_cold': decision['extra_cold'],
+            'heatpack': needs_heatpack,
+            'packing_list': decision['packing_list']
+        }
+        modified_decisions.append(modified_decision)
+    
+    # Define new fieldnames without the removed fields
+    fieldnames = ['order_id', 'customer_name', 'city', 'province', 'can_ship', 'shipping_day', 'temperature', 'extra_cold', 'heatpack', 'packing_list']
     
     with open(output_file, 'w', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
-        for decision in sorted_decisions:
+        for decision in modified_decisions:
             writer.writerow(decision)
     
     print(f"Shipping report generated: {output_file}")
     
+    # Generate warehouse pick list for 'other items' grouped by shipping day
+    generate_warehouse_pick_list(decisions)
+    
     # Print summary
     total = len(decisions)
     shippable = sum(1 for d in decisions if d['can_ship'])
+    extra_cold = sum(1 for d in decisions if d['extra_cold'])
+    wednesday_orders = sum(1 for d in decisions if d['shipping_day'] == 'Wednesday' and d['can_ship'])
+    thursday_orders = sum(1 for d in decisions if d['shipping_day'] == 'Thursday' and d['can_ship'])
+    
     print(f"\nSummary:")
     print(f"Total orders: {total}")
     print(f"Shippable orders: {shippable} ({shippable/total*100:.1f}%)")
+    print(f"  - Wednesday deliveries: {wednesday_orders}")
+    print(f"  - Thursday deliveries: {thursday_orders}")
+    print(f"  - Extra cold orders (requiring insulation): {extra_cold}")
     print(f"Unshippable orders: {total-shippable} ({(total-shippable)/total*100:.1f}%)")
+
+
+def generate_warehouse_pick_list(decisions, output_file="warehouse_pick_list.csv"):
+    """Generate a consolidated warehouse pick list for 'other items' grouped by shipping day"""
+    if not decisions:
+        print("No shipping decisions to report.")
+        return
+    
+    # Filter for shippable orders only
+    shippable_orders = [d for d in decisions if d['can_ship']]
+    
+    # Group by shipping day
+    wednesday_orders = [d for d in shippable_orders if d['shipping_day'] == 'Wednesday']
+    thursday_orders = [d for d in shippable_orders if d['shipping_day'] == 'Thursday']
+    
+    # Create a dictionary to track item quantities by day
+    warehouse_items = {
+        'Wednesday': {},
+        'Thursday': {}
+    }
+    
+    # Process Wednesday orders
+    for order in wednesday_orders:
+        if not order['other_items']:
+            continue
+            
+        # Split the other_items string into individual items
+        items = order['other_items'].split(', ')
+        for item in items:
+            # Extract quantity and item name
+            parts = item.split(' x ', 1)
+            if len(parts) == 2:
+                qty_str, item_name = parts
+                try:
+                    qty = int(qty_str)
+                    if item_name in warehouse_items['Wednesday']:
+                        warehouse_items['Wednesday'][item_name] += qty
+                    else:
+                        warehouse_items['Wednesday'][item_name] = qty
+                except ValueError:
+                    # Skip if quantity is not a valid number
+                    pass
+    
+    # Process Thursday orders
+    for order in thursday_orders:
+        if not order['other_items']:
+            continue
+            
+        # Split the other_items string into individual items
+        items = order['other_items'].split(', ')
+        for item in items:
+            # Extract quantity and item name
+            parts = item.split(' x ', 1)
+            if len(parts) == 2:
+                qty_str, item_name = parts
+                try:
+                    qty = int(qty_str)
+                    if item_name in warehouse_items['Thursday']:
+                        warehouse_items['Thursday'][item_name] += qty
+                    else:
+                        warehouse_items['Thursday'][item_name] = qty
+                except ValueError:
+                    # Skip if quantity is not a valid number
+                    pass
+    
+    # Write to CSV
+    with open(output_file, 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Shipping Day', 'Item', 'Total Quantity'])
+        
+        # Write Wednesday items
+        if warehouse_items['Wednesday']:
+            for item_name, qty in sorted(warehouse_items['Wednesday'].items()):
+                writer.writerow(['Wednesday', item_name, qty])
+        
+        # Write Thursday items
+        if warehouse_items['Thursday']:
+            for item_name, qty in sorted(warehouse_items['Thursday'].items()):
+                writer.writerow(['Thursday', item_name, qty])
+    
+    print(f"Warehouse pick list generated: {output_file}")
 
 
 def get_weather(city, province):

@@ -20,8 +20,6 @@ BASE_URL = f"https://{SHOPIFY_SHOP_URL}/admin/api/{API_VERSION}"
 # Constants for the recommender system
 VENDOR_NAME = "Tropica"  # Only recommend products from this vendor
 ORDER_FREQUENCY_DAYS = 14  # Ordering every 2 weeks
-MIN_STOCK_THRESHOLD = 5  # Minimum stock to maintain
-RESTOCK_BUFFER = 1.2  # Buffer multiplier for recommended quantity (20% extra)
 
 
 def get_products(vendor=None):
@@ -169,10 +167,13 @@ def get_committed_quantities(product_ids, product_map):
 
 
 def get_recent_orders(days=14):
-    """Get orders from the last specified number of days"""
+    """Get orders from the last specified number of days (including today)"""
     # Calculate date range
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
+    # Ensure we include the full current day by setting the time to 23:59:59
+    end_date = end_date.replace(hour=23, minute=59, second=59)
+    # Subtract (days-1) to ensure we get exactly 'days' days including today
+    start_date = end_date - timedelta(days=days-1)
     
     # Format dates for Shopify API
     start_date_str = start_date.strftime("%Y-%m-%d")
@@ -224,30 +225,26 @@ def calculate_sales_by_product(orders, product_map):
     return sales_by_product
 
 
-def calculate_recommended_quantity(sales_quantity, current_inventory, incoming_inventory, committed_quantity=0):
+def calculate_recommended_quantity(sales_quantity, current_inventory, incoming_inventory):
     """Calculate recommended order quantity based on sales, current inventory, incoming inventory, and committed quantities"""
-    # Expected sales for the next order period
-    expected_sales = sales_quantity
+    # Determine buffer based on sales volume
+    # 20% buffer for products selling 10 or more units, 15% for others
+    buffer = 1.2 if sales_quantity >= 10 else 1.15
+    
+    # Expected sales for the next order period with appropriate buffer
+    expected_sales_with_buffer = sales_quantity * buffer
     
     # Total available inventory (current + incoming - committed)
-    # Subtract committed quantities from available inventory
-    total_available = current_inventory + incoming_inventory - committed_quantity
+    total_available = current_inventory + incoming_inventory
     
-    # Handle negative inventory differently - it means we're already short this amount
+    # Calculate needed quantity
+    # If total_available is negative, we're already short this amount
     if total_available < 0:
         # We need to cover the negative inventory plus expected sales with buffer
-        needed = abs(total_available) + (expected_sales * RESTOCK_BUFFER)
+        needed = abs(total_available) + expected_sales_with_buffer
     else:
         # Normal calculation when inventory is positive
-        needed = max(0, (expected_sales * RESTOCK_BUFFER) - total_available)
-    
-    # Only apply minimum stock threshold if the product has sales
-    # But don't double-count the negative inventory adjustment
-    if sales_quantity > 0 and total_available >= 0 and total_available < MIN_STOCK_THRESHOLD:
-        needed += (MIN_STOCK_THRESHOLD - total_available)
-    elif sales_quantity > 0 and total_available < 0:
-        # For negative inventory, ensure we at least reach the minimum threshold
-        needed = max(needed, abs(total_available) + MIN_STOCK_THRESHOLD)
+        needed = max(0, expected_sales_with_buffer - total_available)
     
     return round(needed)
 
@@ -295,8 +292,11 @@ def generate_purchase_order_recommendations():
         committed = committed_quantities.get(product_id, 0)
         
         recommended_quantity = calculate_recommended_quantity(
-            sales_quantity, current_inventory, incoming, committed
+            sales_quantity, current_inventory, incoming
         )
+        
+        # Calculate the buffer percentage for display
+        buffer_percent = "20%" if sales_quantity >= 10 else "15%"
         
         recommendations.append({
             'product_id': product_id,
@@ -305,6 +305,7 @@ def generate_purchase_order_recommendations():
             'current_inventory': current_inventory,
             'incoming_inventory': incoming,
             'committed_quantity': committed,
+            'buffer_used': buffer_percent,
             'recommended_order': recommended_quantity
         })
     
@@ -329,11 +330,12 @@ def display_recommendations(recommendations):
             rec['current_inventory'],
             rec['incoming_inventory'],
             rec['committed_quantity'],
+            rec['buffer_used'],
             rec['recommended_order']
         ])
     
     # Display table
-    headers = ["Item", "Sales (2 Weeks)", "Current Inventory", "Incoming", "Committed", "Recommended Order"]
+    headers = ["Item", "Sales (2 Weeks)", "Current Inventory", "Incoming", "Committed", "Buffer", "Recommended Order"]
     print(tabulate(table_data, headers=headers, tablefmt="grid"))
     
     # Export to CSV
@@ -344,7 +346,7 @@ def export_to_csv(recommendations, filename="tropica_order_recommendations.csv")
     """Export recommendations to a CSV file"""
     with open(filename, 'w', newline='') as csvfile:
         fieldnames = ['item', 'sales_last_2_weeks', 'current_inventory', 
-                     'incoming_inventory', 'committed_quantity', 'recommended_order']
+                     'incoming_inventory', 'committed_quantity', 'buffer_used', 'recommended_order']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
         
         writer.writeheader()
@@ -357,6 +359,13 @@ def export_to_csv(recommendations, filename="tropica_order_recommendations.csv")
 def main():
     """Main function to run the purchase order recommender"""
     print("\n===== Tropica Plant Purchase Order Recommender =====\n")
+    print("Calculating recommendations based on:")
+    print("1. Sales from the last 2 weeks (demand)")
+    print("2. Current inventory levels")
+    print("3. Incoming inventory (if any)")
+    print("4. Committed quantities (unfulfilled orders)")
+    print("5. Dynamic buffer: 20% for high-selling items (10+ units), 15% for others")
+    print("\nFormula: (Sales × Buffer) - (Current + Incoming - Committed)\n")
     
     try:
         recommendations = generate_purchase_order_recommendations()
