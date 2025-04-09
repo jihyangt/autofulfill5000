@@ -45,6 +45,7 @@ def analyze_shipping_conditions(city, province):
             "can_ship": False,
             "wednesday_delivery": False,
             "thursday_delivery": False,
+            "preferred_wednesday": True,
             "reason": "Location not found",
             "wed_avg_temp": None,
             "thu_avg_temp": None,
@@ -74,6 +75,7 @@ def analyze_shipping_conditions(city, province):
             "can_ship": False,
             "wednesday_delivery": False,
             "thursday_delivery": False,
+            "preferred_wednesday": True,
             "reason": "Weather data unavailable",
             "wed_avg_temp": None,
             "thu_avg_temp": None,
@@ -105,26 +107,42 @@ def analyze_shipping_conditions(city, province):
     thu_avg_temp = None
     wednesday_delivery = False
     thursday_delivery = False
+    preferred_wednesday = True  # Default to Wednesday unless conditions suggest otherwise
     
     if wednesday_business_hours_temps:
         wed_avg_temp = sum(wednesday_business_hours_temps) / len(wednesday_business_hours_temps)
-        wednesday_delivery = wed_avg_temp >= -2.0
+        wednesday_delivery = wed_avg_temp >= -1.0
     
     if thursday_business_hours_temps:
         thu_avg_temp = sum(thursday_business_hours_temps) / len(thursday_business_hours_temps)
-        thursday_delivery = thu_avg_temp >= -2.0
+        thursday_delivery = thu_avg_temp >= -1.0
     
     # Determine overall shipping possibility
     can_ship = wednesday_delivery or thursday_delivery
     
-    # Check for extra cold conditions (between 0°C and -2°C)
+    # Check for extra cold conditions (between 0°C and -1°C)
     extra_cold = False
-    if wednesday_delivery and wed_avg_temp is not None and 0 >= wed_avg_temp >= -2:
+    if wednesday_delivery and wed_avg_temp is not None and 0 >= wed_avg_temp >= -1:
         extra_cold = True
-    if thursday_delivery and thu_avg_temp is not None and 0 >= thu_avg_temp >= -2:
+    if thursday_delivery and thu_avg_temp is not None and 0 >= thu_avg_temp >= -1:
         extra_cold = True
     
+    # Optimize shipping day based on temperature
+    # For cold orders (<2°C), prefer the warmer day between Wednesday and Thursday
+    # For warmer orders, default to Wednesday unless Thursday is significantly warmer
+    preferred_wednesday = wednesday_delivery
     reason = "Weather conditions acceptable for delivery"
+    
+    if wednesday_delivery and thursday_delivery and thu_avg_temp is not None and wed_avg_temp is not None:
+        # For cold orders (below 2°C), always prefer the warmer day
+        if (wed_avg_temp < 2.0 or thu_avg_temp < 2.0) and thu_avg_temp > wed_avg_temp:
+            preferred_wednesday = False
+            reason = "Optimized for warmer temperature on Thursday (cold order)"
+        # For warmer orders, only prefer Thursday if it's significantly warmer
+        elif thu_avg_temp > wed_avg_temp and thu_avg_temp > 2.0:
+            preferred_wednesday = False
+            reason = "Optimized for warmer temperature on Thursday"
+        
     if not can_ship:
         reason = "Temperature too low on both Wednesday and Thursday"
     elif wednesday_delivery and not thursday_delivery:
@@ -139,6 +157,7 @@ def analyze_shipping_conditions(city, province):
         "can_ship": can_ship,
         "wednesday_delivery": wednesday_delivery,
         "thursday_delivery": thursday_delivery,
+        "preferred_wednesday": preferred_wednesday,
         "reason": reason,
         "wed_avg_temp": wed_avg_temp,
         "thu_avg_temp": thu_avg_temp,
@@ -150,7 +169,7 @@ def analyze_shipping_conditions(city, province):
     }
 
 
-def process_orders_csv(csv_file="orders_export (4).csv"):
+def process_orders_csv(csv_file="orders_export.csv"):
     """Process orders from CSV and determine shipping eligibility"""
     shipping_decisions = []
     
@@ -184,8 +203,10 @@ def process_orders_csv(csv_file="orders_export (4).csv"):
                         # Special cases for specific shrimp names and excluding ShrimpsafeNet
                         is_shrimp_or_potted = (
                             ('shrimp' in item_name.lower() and not 'shrimpsafe' in item_name.lower()) or 
-                            'extreme blue bolt' in item_name.lower() or
-                            'red pinto galaxy' in item_name.lower() or
+                            'blue bolt' in item_name.lower() or
+                            'pinto galaxy' in item_name.lower() or
+                            'subwassertang' in item_name.lower() or 
+                            'duckweed' in item_name.lower() or 
                             'pack' in item_name.lower() or 
                             'potted' in item_name.lower()
                             # Removed 1-2-grow as requested
@@ -248,7 +269,12 @@ def process_orders_csv(csv_file="orders_export (4).csv"):
                     shipping_result['packing_list'] = packing_list.strip()
                     shipping_result['shrimp_potted_items'] = ", ".join(shrimp_potted_list) if shrimp_potted_list else ""
                     shipping_result['other_items'] = ", ".join(other_items_list) if other_items_list else ""
-                    shipping_result['shipping_day'] = "Wednesday" if shipping_result['wednesday_delivery'] else "Thursday" if shipping_result['thursday_delivery'] else "None"
+                    # Determine shipping day based on temperature optimization
+                    # Use the preferred_wednesday field to determine shipping day
+                    if 'preferred_wednesday' in shipping_result and shipping_result['wednesday_delivery'] and shipping_result['thursday_delivery']:
+                        shipping_result['shipping_day'] = "Wednesday" if shipping_result['preferred_wednesday'] else "Thursday"
+                    else:
+                        shipping_result['shipping_day'] = "Wednesday" if shipping_result['wednesday_delivery'] else "Thursday" if shipping_result['thursday_delivery'] else "None"
                     shipping_decisions.append(shipping_result)
                     processed_order_ids.add(order_id)
                 else:
@@ -303,8 +329,25 @@ def generate_shipping_report(decisions, output_file="shipping_decisions.csv"):
         print("No shipping decisions to report.")
         return
     
-    # Sort decisions by shipping day and can_ship field
-    sorted_decisions = sorted(decisions, key=lambda x: (x['shipping_day'] != 'Wednesday', x['shipping_day'] != 'Thursday', not x['can_ship']))
+    # Sort decisions by shipping day only
+    # Orders are sorted by: Shipping day (Wednesday first, then Thursday, then non-shippable)
+    
+    # Define a function to get shipping day priority (1 for Wednesday, 2 for Thursday, 3 for None)
+    def get_shipping_day_priority(decision):
+        # First check if it can be shipped at all
+        if not decision['can_ship']:
+            return 3  # Non-shippable orders come last
+        # Then check which day it's scheduled for based on the shipping_day field
+        elif decision['shipping_day'] == 'Wednesday':
+            return 1  # Wednesday orders come first
+        elif decision['shipping_day'] == 'Thursday':
+            return 2  # Thursday orders come second
+        else:
+            return 3  # Fallback for any other case
+    
+    sorted_decisions = sorted(decisions, key=lambda x: (
+        get_shipping_day_priority(x)  # Wednesday first, then Thursday, then None
+    ))
     
     # Prepare decisions with modified fields
     modified_decisions = []
@@ -320,9 +363,9 @@ def generate_shipping_report(decisions, output_file="shipping_decisions.csv"):
         # Update shipping day to include date or set to N/A if can't ship
         if not decision['can_ship']:
             shipping_day_with_date = "N/A"
-        elif decision['wednesday_delivery']:
+        elif decision['shipping_day'] == 'Wednesday':
             shipping_day_with_date = f"Wednesday {decision['wednesday_date']}"
-        elif decision['thursday_delivery']:
+        elif decision['shipping_day'] == 'Thursday':
             shipping_day_with_date = f"Thursday {decision['thursday_date']}"
         else:
             shipping_day_with_date = "N/A"
@@ -330,9 +373,9 @@ def generate_shipping_report(decisions, output_file="shipping_decisions.csv"):
         # Create modified decision with only required fields
         # Add temperature for the shipping day
         shipping_temp = None
-        if decision['wednesday_delivery'] and decision['shipping_day'] == 'Wednesday':
+        if decision['shipping_day'] == 'Wednesday':
             shipping_temp = decision['wed_avg_temp']
-        elif decision['thursday_delivery'] and decision['shipping_day'] == 'Thursday':
+        elif decision['shipping_day'] == 'Thursday':
             shipping_temp = decision['thu_avg_temp']
             
         # Format temperature to 1 decimal place if available
